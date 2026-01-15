@@ -600,15 +600,30 @@ def get_attn_info(arg_type, attn_mode, args_dict, op_cls=None):
 
 
 
+def precompute_freqs_cis(
+    max_seq_len, dim, 
+    theta: float = 10000.0
+):
+    inv_freq = 1.0 / (
+        theta ** (torch.arange(0, dim, 2).float() / dim)
+    )
+    t = torch.arange(max_seq_len, device=inv_freq.device).type_as(inv_freq)
+    freqs = torch.einsum("i,j->ij", t, inv_freq)
+    freqs = torch.cat([freqs, freqs], dim=1)
+    cos = freqs.cos().bfloat16()
+    sin = freqs.sin().bfloat16()
+    return cos, sin
 
 
-def precompute_freqs_cis(dim, max_seq_len, theta: float = 10000.0):
-    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
-    t = torch.arange(max_seq_len, device=freqs.device)
-    freqs = torch.outer(t, freqs).float()
-    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
-    return torch.real(freqs_cis), torch.imag(freqs_cis)
 
+def rotate(qk, cos, sin):
+    # [q_len, q_head_num + kv_head_num, rope_dim]
+    rope_dim = qk.size(-1)
+    left_part = qk[:, :, :rope_dim//2]
+    right_part = qk[:, :, rope_dim//2:]
+    output = torch.cat([left_part, right_part], dim=-1) * cos.unsqueeze(1) + \
+             torch.cat([-right_part, left_part], dim=-1) * sin.unsqueeze(1)
+    return output
 
 
 

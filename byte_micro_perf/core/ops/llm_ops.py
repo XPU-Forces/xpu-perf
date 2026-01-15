@@ -12,7 +12,7 @@ sys.path.insert(
 )
 
 from core.utils import OpTensorInfo, calc_tensor_size, get_torch_dtype
-from core.utils import precompute_freqs_cis, get_attn_info, get_moe_tokens_info
+from core.utils import precompute_freqs_cis, rotate, get_attn_info, get_moe_tokens_info
 from core.utils import smooth_per_token_dynamic_quant, static_quant
 from core.op import BasicOp
 
@@ -214,7 +214,7 @@ class HeadRMSNormOp(BasicOp):
         head_data = token_data[:, self.norm_head_start:self.norm_head_end, :]
         head_data = torch.nn.functional.rms_norm(
             head_data, 
-            normalized_shape=head_data.shape[-1],
+            normalized_shape=head_data.shape[-1:],
             weight=norm_weight,
             eps=self.eps
         )
@@ -312,7 +312,7 @@ class HeadRMSNormDynamicQuantOp(BasicOp):
         # per head rms_norm
         after_norm = torch.nn.functional.rms_norm(
             token_data, 
-            normalized_shape=token_data.shape[-1],
+            normalized_shape=token_data.shape[-1:],
             weight=norm_weight,
             eps=self.eps
         )
@@ -408,7 +408,7 @@ class AddRmsNormOp(BasicOp):
 
         output = torch.nn.functional.rms_norm(
             hidden_states + residual, 
-            normalized_shape=hidden_states.shape[-1],
+            normalized_shape=hidden_states.shape[-1:],
             weight=norm_weight,
             eps=self.eps
         )
@@ -532,7 +532,7 @@ class AddRmsNormDynamicQuantOp(BasicOp):
         # rms norm
         after_norm = torch.nn.functional.rms_norm(
             after_res, 
-            normalized_shape=after_res.shape[-1], 
+            normalized_shape=after_res.shape[-1:], 
             eps=self.eps
         )
 
@@ -584,9 +584,7 @@ class RotaryEmbeddingOp(BasicOp):
         self.rope_offset = self.args_dict.get("rope_offset", 0)
         self.rope_dim = self.args_dict["rope_dim"]
 
-        cos_tensor, sin_tensor = precompute_freqs_cis(
-            self.rope_dim * 2, self.max_kv_len
-        )
+        cos_tensor, sin_tensor = precompute_freqs_cis(self.max_kv_len, self.rope_dim)
 
         self.input_tensor_info = {
             "packed_qkv": OpTensorInfo(
@@ -668,20 +666,6 @@ class RotaryEmbeddingOp(BasicOp):
         sin = tensor_mapping["sin"]
         
 
-        def rotate(qk, cos, sin):
-            # [q_seq_len, q_head_num + kv_head_num, head_dim]
-            x1 = qk[..., :self.rope_dim//2]
-            x2 = qk[..., self.rope_dim//2:]
-
-            cos = cos.unsqueeze(1)
-            sin = sin.unsqueeze(1)
-
-            x1_rot = x1 * cos - x2 * sin
-            x2_rot = x1 * sin + x2 * cos
-
-            return torch.cat([x1_rot, x2_rot], dim=-1)
-            
-
         # for each batch
         for batch_idx in range(self.batch_size):
             q_len = self.q_lens[batch_idx]
@@ -700,11 +684,13 @@ class RotaryEmbeddingOp(BasicOp):
             cache_start = cache_len
             cache_end = cache_len + q_len
 
-            target_qk = packed_qkv[token_start:token_end, qk_head_start:qk_head_end, dim_start:dim_end]
+            target_qk = packed_qkv[token_start:token_end, qk_head_start:qk_head_end, dim_start:dim_end].contiguous()
             target_cos = cos[cache_start:cache_end]
             target_sin = sin[cache_start:cache_end]
 
-            target_qk = rotate(target_qk, target_cos, target_sin)
+            packed_qkv[token_start:token_end, qk_head_start:qk_head_end, dim_start:dim_end].copy_(
+                rotate(target_qk, target_cos, target_sin)
+            )
 
         return packed_qkv
 
