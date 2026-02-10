@@ -52,13 +52,13 @@ class RMSNormOp(BasicOp):
             "src": OpTensorInfo(
                 shape=[self.batch_size, self.dim_size],
                 dtype=self.torch_dtype,
-                device=self.backend.torch_device_name, 
+                device=self.backend.get_torch_device_name(), 
                 creator=torch.randn
             ),
             "weight": OpTensorInfo(
                 shape=[self.dim_size],
                 dtype=self.torch_dtype,
-                device=self.backend.torch_device_name, 
+                device=self.backend.get_torch_device_name(), 
                 creator=torch.ones
             )
         }
