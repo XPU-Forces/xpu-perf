@@ -462,7 +462,6 @@ def get_attn_info(arg_type, attn_mode, args_dict, op_cls=None):
         cache_lens = [cache_len + int(cache_len * (random.randint(-unbalance_cache, unbalance_cache) / 100)) for i in range(batch_size)]
         kv_lens = [q_len + cache_len for q_len, cache_len in zip(q_lens, cache_lens)]
 
-
     elif arg_type == "batch_llm":
         q_lens = args_dict["q_lens"]
         cache_lens = args_dict["cache_lens"]

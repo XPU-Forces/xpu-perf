@@ -341,7 +341,9 @@ for **batch_llm** arg_type, used to generate q_lens/cache_lens/kv_lens/accum_q_l
 
 
 ### 3.3 dequant_kv_cache
-Given quantized **k_cache/v_cache**, dequantize them to bfloat16 while preserving the original format (linear/paged).
+Given quantized **k_cache/v_cache**, dequantize them to **dst_dtype** while preserving the original format (linear/paged).
+
+This operator currently only support static quant, which quant scale shape is [kv_head_num, head_dim].
 
 This operator is out-place.
 
@@ -350,12 +352,12 @@ This operator is out-place.
 - (in) k_cache
     - **linear**: [max_batch_size, kv_head_num, max_seq_len, head_dim]
     - **paged**: [max_block_size, kv_head_num, block_size, head_dim]
-    - int8 / float8
+    - int8 / float8, determined by **dtype** attr
 
 - (in) v_cache
     - **linear**: [max_batch_size, kv_head_num, max_seq_len, head_dim]
     - **paged**: [max_block_size, kv_head_num, block_size, head_dim]
-    - int8 / float8
+    - int8 / float8, determined by **dtype** attr
 
 - (in) k_scale
     - [kv_head_num, head_dim]
@@ -365,12 +367,26 @@ This operator is out-place.
     - [kv_head_num, head_dim]
     - float32
 
+- (in) kv_lens
+    - [max_batch_size, ]
+    - int32
+    - specify kv_len for each seq
+
+---
+**optional** only necessary for linear kv_cache
+
+- (in) slot_mapping
+    - [max_batch_size, ]
+    - int32
+    - specify cache slot for each input seq
+
 ---
 **optional** only necessary for paged kv_cache
 
 - (in) block_table
-    - [max_batch_size, max_seq_len]
+    - [max_batch_size, max_block_num_per_seq]
     - int32
+    - specify block ids for each input seq
 
 
 ---
@@ -378,12 +394,12 @@ This operator is out-place.
 - (in) dequant_k_cache
     - **linear**: [max_batch_size, kv_head_num, max_seq_len, head_dim]
     - **paged**: [max_block_size, kv_head_num, block_size, head_dim]
-    - bfloat16
+    - bfloat16, determined by **dst_dtype**
 
 - (in) dequant_v_cache
     - **linear**: [max_batch_size, kv_head_num, max_seq_len, head_dim]
     - **paged**: [max_block_size, kv_head_num, block_size, head_dim]
-    - bfloat16
+    - bfloat16, determined by **dst_dtype**
 
 ---
 for **llm** arg_type, used to generate q_lens/cache_lens/kv_lens/accum_q_lens/accum_kv_lens.
@@ -403,8 +419,8 @@ for **batch_llm** arg_type, used to generate q_lens/cache_lens/kv_lens/accum_q_l
 
 ---
 
-- (attr) dtype, support {bfloat16}
-- (attr) cache_dtype, support {int8, float8}
+- (attr) dtype, support {int8, float8}
+- (attr) dst_dtype, support {bfloat16}
 - (attr) kv_head_num
 - (attr) head_dim
 - (attr) block_size, default is 0, which means linear kv_cache, otherwise paged kv_cache

@@ -957,6 +957,9 @@ class DequantKVCacheOp(BasicOp):
         super().__init__(args_dict, backend, *args, **kwargs)
 
     def prepare(self):
+        """
+        necessary pre-process for attn-related ops
+        """
         self.arg_type = self.args_dict["arg_type"]
         if not self.arg_type in ["llm", "batch_llm"]:
             raise ValueError
@@ -967,74 +970,47 @@ class DequantKVCacheOp(BasicOp):
         get_attn_info(self.arg_type, self.attn_mode, self.args_dict, self)
 
         """
-        src_dtype / cache_dtype
+        dtype --> (dequant) dst_dtype
+        per head per head_dim static quant
         """
-        self.dtype = self.args_dict.get("dtype", "bfloat16")
-        if not self.dtype in ["bfloat16"]:
+        self.dtype = self.args_dict.get("dtype", "int8")
+        if not self.dtype in ["int8", "float8"]:
             raise ValueError
         self.torch_dtype = get_torch_dtype(self.dtype)
 
-        self.cache_dtype = self.args_dict.get("cache_dtype", "bfloat16")
-        if not self.cache_dtype in ["bfloat16", "int8", "float8"]:
+        self.dst_dtype = self.args_dict.get("dst_dtype", "bfloat16")
+        if not self.dst_dtype in ["bfloat16"]:
             raise ValueError
-        self.cache_torch_dtype = get_torch_dtype(self.cache_dtype)
-
+        self.dst_torch_dtype = get_torch_dtype(self.dst_dtype)
 
         # pre-defined attrs
         self.kv_head_num = self.args_dict["kv_head_num"]
         self.head_dim = self.args_dict["head_dim"]
 
-
         # target quant method for k_cache/v_cache
         self.quant_mode = self.args_dict.get("quant_mode", "static")
-        if not self.quant_mode in ["static", "dynamic_per_token", "dynamic_per_block"]:
+        if not self.quant_mode in ["static"]:
             raise ValueError
-
+    
         # all tokens with same head/head_dim element pos share one scale
         if self.quant_mode == "static":
-            self.quant_scale_shape = [
-                self.kv_head_num, self.head_dim
-            ]
-        # head_dim per token share one scale
-        elif self.quant_mode == "dynamic_per_token":
-            self.quant_scale_shape = [
-                self.batch_size, self.kv_head_num,self.max_kv_len
-            ]
-        # [seq_quant_block_size, head_dim_quant_block_size] share one scale
-        elif self.quant_mode == "dynamic_per_block":
-            self.seq_quant_block_size = self.args_dict.get("seq_quant_block_size", 16)
-            self.head_dim_quant_block_size = self.args_dict.get("head_dim_quant_block_size", 16)
-
-            self.quant_scale_shape = [
-                self.batch_size, 
-                self.kv_head_num, 
-                self.max_kv_len // self.seq_quant_block_size, 
-                self.head_dim // self.head_dim_quant_block_size
-            ]
-
-
+            self.quant_scale_shape = [self.kv_head_num, self.head_dim]
 
         self.input_tensor_info = {
-            "slot_mapping": OpTensorInfo(
-                shape=[self.batch_size],
-                dtype=torch.int32, 
-                device=self.backend.get_torch_device_name(), 
-                creator=lambda size, dtype, device: torch.tensor(self.slot_mapping, dtype=dtype, device=device)
-            ), 
             "kv_lens": OpTensorInfo(
-                shape=[self.batch_size], 
+                shape=[self.batch_size, ], 
                 dtype=torch.int32, 
                 device=self.backend.get_torch_device_name(), 
                 creator=lambda size, dtype, device: torch.tensor(self.kv_lens, dtype=dtype, device=device)
             ), 
             "k_scale": OpTensorInfo(
-                shape=[self.kv_head_num, self.head_dim],
+                shape=self.quant_scale_shape,
                 dtype=torch.float32,
                 device=self.backend.get_torch_device_name(),
                 creator=torch.empty
             ), 
             "v_scale": OpTensorInfo(
-                shape=[self.kv_head_num, self.head_dim],
+                shape=self.quant_scale_shape,
                 dtype=torch.float32,
                 device=self.backend.get_torch_device_name(),
                 creator=torch.empty
@@ -1043,6 +1019,13 @@ class DequantKVCacheOp(BasicOp):
         self.output_tensor_info = {}
 
         if self.cache_type == "linear":
+            self.input_tensor_info["slot_mapping"] = OpTensorInfo(
+                shape=[self.batch_size, ],
+                dtype=torch.int32, 
+                device=self.backend.get_torch_device_name(), 
+                creator=lambda size, dtype, device: \
+                    torch.tensor(self.slot_mapping, dtype=dtype, device=device)
+            )
             self.input_tensor_info["k_cache"] = OpTensorInfo(
                 shape=[self.batch_size, self.kv_head_num, self.max_kv_len, self.head_dim], 
                 dtype=self.torch_dtype, 
@@ -1058,19 +1041,26 @@ class DequantKVCacheOp(BasicOp):
 
             self.output_tensor_info["dequant_k_cache"] = OpTensorInfo(
                 shape=[self.batch_size, self.kv_head_num, self.max_kv_len, self.head_dim], 
-                dtype=self.cache_torch_dtype,
+                dtype=self.dst_torch_dtype,
                 device=self.backend.get_torch_device_name(),
                 creator=torch.empty
             )
             self.output_tensor_info["dequant_v_cache"] = OpTensorInfo(
                 shape=[self.batch_size, self.kv_head_num, self.max_kv_len, self.head_dim], 
-                dtype=self.cache_torch_dtype,
+                dtype=self.dst_torch_dtype,
                 device=self.backend.get_torch_device_name(),
                 creator=torch.empty
             )
 
 
         elif self.cache_type == "paged":
+            self.input_tensor_info["block_table"] = OpTensorInfo(
+                shape=[self.batch_size, self.max_block_num_per_seq], 
+                dtype=torch.int32, 
+                device=self.backend.get_torch_device_name(), 
+                creator=lambda size, dtype, device: \
+                    torch.tensor(self.block_table, dtype=dtype, device=device)
+            )
             self.input_tensor_info["k_cache"] = OpTensorInfo(
                 shape=[self.num_kv_blocks, self.kv_head_num, self.block_size, self.head_dim],
                 dtype=self.torch_dtype,
@@ -1083,22 +1073,16 @@ class DequantKVCacheOp(BasicOp):
                 device=self.backend.get_torch_device_name(), 
                 creator=torch.empty
             )
-            self.input_tensor_info["block_table"] = OpTensorInfo(
-                shape=[self.batch_size, self.max_block_num_per_seq], 
-                dtype=torch.int32, 
-                device=self.backend.get_torch_device_name(), 
-                creator=lambda size, dtype, device: torch.ones(size, dtype=dtype, device=device) * -1
-            )
 
             self.output_tensor_info["dequant_k_cache"] = OpTensorInfo(
                 shape=[self.num_kv_blocks, self.kv_head_num, self.block_size, self.head_dim], 
-                dtype=self.cache_torch_dtype,
+                dtype=self.dst_torch_dtype,
                 device=self.backend.get_torch_device_name(),
                 creator=torch.empty
             )
             self.output_tensor_info["dequant_v_cache"] = OpTensorInfo(
                 shape=[self.num_kv_blocks, self.kv_head_num, self.block_size, self.head_dim], 
-                dtype=self.cache_torch_dtype,
+                dtype=self.dst_torch_dtype,
                 device=self.backend.get_torch_device_name(),
                 creator=torch.empty
             )
@@ -1108,25 +1092,26 @@ class DequantKVCacheOp(BasicOp):
         self.tensor_size = self.input_tensor_size + self.output_tensor_size
 
         self.read_bytes = \
-            calc_tensor_size(self.input_tensor_info["slot_mapping"]) + \
             calc_tensor_size(self.input_tensor_info["kv_lens"]) + \
             calc_tensor_size(self.input_tensor_info["k_scale"]) + \
             calc_tensor_size(self.input_tensor_info["v_scale"])
 
         if self.cache_type == "linear":
             self.read_bytes += \
+                calc_tensor_size(self.input_tensor_info["slot_mapping"]) + \
                 calc_tensor_size(self.input_tensor_info["k_cache"]) / self.batch_size / self.max_kv_len * self.num_kv_tokens + \
                 calc_tensor_size(self.input_tensor_info["v_cache"]) / self.batch_size / self.max_kv_len * self.num_kv_tokens
             
             self.write_bytes = \
                 calc_tensor_size(self.output_tensor_info["dequant_k_cache"]) / self.batch_size / self.max_kv_len * self.num_kv_tokens + \
                 calc_tensor_size(self.output_tensor_info["dequant_v_cache"]) / self.batch_size / self.max_kv_len * self.num_kv_tokens
+
         elif self.cache_type == "paged":
             self.read_bytes += \
+                calc_tensor_size(self.input_tensor_info["block_table"]) / self.batch_size / self.max_block_num_per_seq * self.num_kv_blocks + \
                 calc_tensor_size(self.input_tensor_info["k_cache"]) / self.num_kv_blocks / self.block_size * self.num_kv_tokens + \
-                calc_tensor_size(self.input_tensor_info["v_cache"]) / self.num_kv_blocks / self.block_size * self.num_kv_tokens + \
-                calc_tensor_size(self.input_tensor_info["block_table"]) / self.batch_size / self.max_block_num_per_seq * self.num_kv_blocks
-                
+                calc_tensor_size(self.input_tensor_info["v_cache"]) / self.num_kv_blocks / self.block_size * self.num_kv_tokens
+                  
             self.write_bytes = \
                 calc_tensor_size(self.output_tensor_info["dequant_k_cache"]) / self.num_kv_blocks / self.block_size * self.num_kv_tokens + \
                 calc_tensor_size(self.output_tensor_info["dequant_v_cache"]) / self.num_kv_blocks / self.block_size * self.num_kv_tokens
@@ -1145,39 +1130,51 @@ class DequantKVCacheOp(BasicOp):
 
 
     def dequant_kv_cache_run(self, tensor_mapping):
-        slot_mapping = tensor_mapping["slot_mapping"]
-        kv_lens = tensor_mapping["kv_lens"]
-
         k_cache = tensor_mapping["k_cache"]
         v_cache = tensor_mapping["v_cache"]
-        k_scale = tensor_mapping["k_scale"]
-        v_scale = tensor_mapping["v_scale"]
+        
         dequant_k_cache = tensor_mapping["dequant_k_cache"]
         dequant_v_cache = tensor_mapping["dequant_v_cache"]
+
+        kv_lens = tensor_mapping["kv_lens"]
+        k_scale = tensor_mapping["k_scale"]
+        v_scale = tensor_mapping["v_scale"]
 
         """
         参考linear cache的实现改写成paged cache的实现
         """
         if self.cache_type == "paged":
+            block_table = tensor_mapping["block_table"]
             raise NotImplementedError("DequantKVCacheOp paged cache not implemented yet.")
         
         if self.cache_type == "linear":
+            slot_mapping = tensor_mapping["slot_mapping"]
             for batch_idx in range(self.batch_size):
                 kv_slot_id = self.slot_mapping[batch_idx]
                 kv_len = self.kv_lens[batch_idx]
 
                 # [kv_head_num, kv_len, head_dim]
-                # int8 / float8
+                # dtype = int8 / float8
                 src_k_cache = k_cache[kv_slot_id, :, :kv_len, :].contiguous()
                 src_v_cache = v_cache[kv_slot_id, :, :kv_len, :].contiguous()
 
                 # [kv_head_num, kv_len, head_dim]
-                # bfloat16
+                # dst_dtype = bfloat16
                 dst_k_cache = dequant_k_cache[kv_slot_id, :, :kv_len, :]
                 dst_v_cache = dequant_v_cache[kv_slot_id, :, :kv_len, :]
 
-                dst_k_cache.copy_(torch.mul(src_k_cache.to(k_scale.dtype), k_scale.unsqueeze(1)).to(dtype=self.cache_torch_dtype))
-                dst_v_cache.copy_(torch.mul(src_v_cache.to(v_scale.dtype), v_scale.unsqueeze(1)).to(dtype=self.cache_torch_dtype))
+                dst_k_cache.copy_(
+                    torch.mul(
+                        src_k_cache.to(k_scale.dtype), 
+                        k_scale.unsqueeze(1)
+                    ).to(dtype=self.dst_torch_dtype)
+                )
+                dst_v_cache.copy_(
+                    torch.mul(
+                        src_v_cache.to(v_scale.dtype), 
+                        v_scale.unsqueeze(1)
+                    ).to(dtype=self.dst_torch_dtype)
+                )
 
         return dequant_k_cache, dequant_v_cache
 
