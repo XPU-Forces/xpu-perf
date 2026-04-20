@@ -1,5 +1,5 @@
 <!-- omit in toc -->
-# Contributing to Byte MLPerf
+# Contributing to XPU-Perf
 
 First of all, thanks for taking the time to contribute!
 
