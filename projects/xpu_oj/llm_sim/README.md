@@ -6,7 +6,7 @@
 
 ```
 cd micro_perf
-python3 ./launch.py --backend GPU
+python3 ./server.py --backend GPU
 ```
 
 以上命令有以下操作：
